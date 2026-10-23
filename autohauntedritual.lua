@@ -1,5 +1,5 @@
 --[[
-    FischFright 3 - Haunted Ritual Auto v1.2 Mobile
+    FischFright 3 - Haunted Ritual Auto v1.3 Mobile
 
     Fluxo observado no jogo:
       Frankenstein -> option 2 -> option 3 (Haunted Ritual)
@@ -18,6 +18,7 @@ local Players = game:GetService("Players")
 local TextChatService = game:GetService("TextChatService")
 local UserInputService = game:GetService("UserInputService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
+local ProximityPromptService = game:GetService("ProximityPromptService")
 local RunService = game:GetService("RunService")
 local CoreGui = game:GetService("CoreGui")
 
@@ -339,6 +340,236 @@ local function WaitForOption(number, timeout, token)
 
         task.wait(0.1)
     end
+end
+
+local function FireConnections(signal, ...)
+    if not getconnections then
+        return false
+    end
+
+    local ok, connections = pcall(getconnections, signal)
+    if not ok or type(connections) ~= "table" then
+        return false
+    end
+
+    local fired = false
+    local arguments = {...}
+
+    for _, connection in ipairs(connections) do
+        if connection.Enabled ~= false then
+            local connectionOk = false
+
+            if connection.Fire then
+                connectionOk = pcall(function()
+                    connection:Fire(table.unpack(arguments))
+                end)
+            elseif connection.Function then
+                connectionOk = pcall(function()
+                    connection.Function(table.unpack(arguments))
+                end)
+            end
+
+            fired = connectionOk or fired
+        end
+    end
+
+    return fired
+end
+
+local function FireEngineSignal(signal, ...)
+    local arguments = {...}
+
+    -- Prefere chamar as conexoes reais do Dialog quando o executor expoe
+    -- getconnections. Assim nao aceitamos um firesignal vazio como sucesso.
+    if FireConnections(signal, table.unpack(arguments)) then
+        return true
+    end
+
+    if firesignal then
+        local ok = pcall(function()
+            firesignal(signal, table.unpack(arguments))
+        end)
+        if ok then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function ClickPromptGuiForFrankenstein()
+    local bestObject = nil
+    local bestScore = 0
+
+    for _, object in ipairs(PlayerGui:GetDescendants()) do
+        if (object:IsA("TextLabel") or object:IsA("TextButton"))
+            and IsGuiVisible(object) then
+            local text = string.lower(object.Text or "")
+            local score = 0
+
+            if string.find(text, "frankenstein", 1, true) then
+                score = score + 100
+            end
+            if string.find(text, "talk", 1, true) then
+                score = score + 50
+            end
+
+            if score > bestScore then
+                bestScore = score
+                bestObject = object
+            end
+        end
+    end
+
+    if not bestObject then
+        return false
+    end
+
+    local clickable = bestObject
+    local current = bestObject
+
+    for _ = 1, 5 do
+        if current:IsA("GuiButton") then
+            clickable = current
+            break
+        end
+        if not current.Parent or not current.Parent:IsA("GuiObject") then
+            break
+        end
+        current = current.Parent
+        clickable = current
+    end
+
+    local center = clickable.AbsolutePosition + clickable.AbsoluteSize / 2
+    local touched = pcall(function()
+        VirtualInputManager:SendTouchEvent(0, 0, center.X, center.Y)
+        task.wait(0.08)
+        VirtualInputManager:SendTouchEvent(0, 2, center.X, center.Y)
+    end)
+
+    pcall(function()
+        VirtualInputManager:SendMouseMoveEvent(center.X, center.Y, game)
+        VirtualInputManager:SendMouseButtonEvent(
+            center.X,
+            center.Y,
+            0,
+            true,
+            game,
+            0
+        )
+        task.wait(0.08)
+        VirtualInputManager:SendMouseButtonEvent(
+            center.X,
+            center.Y,
+            0,
+            false,
+            game,
+            0
+        )
+    end)
+
+    return touched or true
+end
+
+local function PressPromptKey(prompt)
+    local key = prompt.KeyboardKeyCode
+    if key == Enum.KeyCode.Unknown then
+        key = Enum.KeyCode.E
+    end
+
+    return pcall(function()
+        VirtualInputManager:SendKeyEvent(true, key, false, game)
+        task.wait(math.max(prompt.HoldDuration, 0.05) + 0.08)
+        VirtualInputManager:SendKeyEvent(false, key, false, game)
+    end)
+end
+
+local function TryFrankensteinMethod(prompt, label, callback, token, waitTime)
+    if not IsCurrent(token) then
+        return nil
+    end
+
+    SetStatus("Frankenstein: " .. label)
+    Log("Tentando interação: " .. label)
+
+    local ok, attempted = pcall(callback)
+    if not ok then
+        Log("Método falhou: " .. label .. " | " .. tostring(attempted))
+    end
+
+    return WaitForOption(2, waitTime or 2.5, token)
+end
+
+local function TriggerFrankensteinDialogue(prompt, token)
+    local option2
+
+    -- O Dialog do Fisch pode escutar diretamente prompt.Triggered.
+    option2 = TryFrankensteinMethod(prompt, "sinal direto", function()
+        return FireEngineSignal(prompt.Triggered, Player)
+    end, token, 2.5)
+    if option2 then
+        return option2
+    end
+
+    -- Algumas versoes usam o evento central do ProximityPromptService.
+    option2 = TryFrankensteinMethod(prompt, "sinal global", function()
+        return FireEngineSignal(
+            ProximityPromptService.PromptTriggered,
+            prompt,
+            Player
+        )
+    end, token, 2.5)
+    if option2 then
+        return option2
+    end
+
+    -- Tenta a funcao do executor sem parametros extras.
+    option2 = TryFrankensteinMethod(prompt, "prompt direto", function()
+        if not fireproximityprompt then
+            return false
+        end
+        return pcall(function()
+            fireproximityprompt(prompt)
+        end)
+    end, token, 3.5)
+    if option2 then
+        return option2
+    end
+
+    -- Alguns executores mobile exigem a assinatura com SkipHold=true.
+    option2 = TryFrankensteinMethod(prompt, "prompt forçado", function()
+        if not fireproximityprompt then
+            return false
+        end
+        return pcall(function()
+            fireproximityprompt(prompt, 0, true)
+        end)
+    end, token, 3.5)
+    if option2 then
+        return option2
+    end
+
+    -- Ultimos fallbacks: toca no GUI mobile, simula o hold e envia a tecla.
+    option2 = TryFrankensteinMethod(prompt, "toque mobile", function()
+        return ClickPromptGuiForFrankenstein()
+    end, token, 2.5)
+    if option2 then
+        return option2
+    end
+
+    option2 = TryFrankensteinMethod(prompt, "hold direto", function()
+        prompt:InputHoldBegin()
+        task.wait(math.max(prompt.HoldDuration, 0.05) + 0.08)
+        prompt:InputHoldEnd()
+        return true
+    end, token, 2.5)
+    if option2 then
+        return option2
+    end
+
+    return TryFrankensteinMethod(prompt, "entrada virtual", function()
+        return PressPromptKey(prompt)
+    end, token, 3)
 end
 
 local function GetRitualComponents()
@@ -719,11 +950,12 @@ local function OpenFrankensteinDialogue(token)
         end
 
         if prompt then
-            -- TriggerPrompt espera o teleporte sincronizar e aciona o prompt
-            -- diretamente, sem depender do botao mobile na tela.
-            TriggerPrompt(prompt, token)
+            -- Posiciona, aguarda o servidor reconhecer o jogador e tenta
+            -- todos os caminhos usados pelo Dialog do jogo.
+            TeleportNearObject(prompt)
+            WaitCancelable(CONFIG.PROMPT_SYNC_WAIT, token)
 
-            local option2 = WaitForOption(2, 7, token)
+            local option2 = TriggerFrankensteinDialogue(prompt, token)
             if option2 then
                 return option2
             end
