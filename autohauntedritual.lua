@@ -1,9 +1,10 @@
 --[[
-    FischFright 3 - Haunted Ritual Auto v1.4 Mobile (dialogo manual)
+    FischFright 3 - Haunted Ritual Auto v1.5 Mobile (detector da mensagem)
 
     Fluxo observado no jogo:
       TP ao Frankenstein -> jogador escolhe Haunted Ritual manualmente
-      Espera os prompts reais de 8 oferendas + 3 pedestais de 50 Treats
+      Detecta nova instrucao visivel de preparacao na tela
+      Busca cada prompt individualmente, aproximando-se dele quando necessario
       Bat Wing -> 7 Jack-o-Lantern offerings -> 3 pedestais de 50 Treats
       Detecta House XXX -> equipa Candy Bucket -> Knock
       Tenta acompanhar o alvo do GhostMinigame -> tenta sair usando uma vara
@@ -15,7 +16,9 @@
       * Toque no botao flutuante para ligar/desligar. Arraste para mover.
       * Fale com Frankenstein em cada ciclo; o script nao toca no dialogo.
       * A espera manual nao tem limite. OFF/UNLOAD cancelam a espera.
-      * O detector usa os prompts observados, nao remotes ou atributos inventados.
+      * A frase exata ainda nao foi registrada: o detector reconhece instrucoes
+        de preparacao em ingles/portugues e grava o texto recebido no LOG.
+      * Oferendas precisam de confirmacao antes de passar aos Treats.
 ]]
 
 local Players = game:GetService("Players")
@@ -51,7 +54,10 @@ local CONFIG = {
     PROMPT_SYNC_WAIT = 0.90,
     PROMPT_AFTER_WAIT = 0.75,
     MANUAL_RITUAL_POLL = 0.25,
-    MANUAL_RITUAL_STABLE_TIME = 0.8,
+    PREPARATION_MAX_AGE = 85,
+    PROMPT_READY_TIMEOUT = 5,
+    PROMPT_CONFIRM_TIMEOUT = 4,
+    PROMPT_ATTEMPTS = 2,
 }
 
 Env.HAUNTED_AUTO_CONFIG = CONFIG
@@ -85,7 +91,28 @@ local OFFERINGS = {
     "Pop-Rock Pufferfish",
 }
 
+local OFFERING_LOCATIONS = {
+    ["bat wing"] = Vector3.new(-15127.9, 146.2, -9600.0),
+    ["sour patch salmon"] = Vector3.new(-15125.4, 146.4, -9640.5),
+    ["taffy trout"] = Vector3.new(-15136.5, 147.1, -9585.7),
+    ["bubblegum blobfish"] = Vector3.new(-15102.6, 146.1, -9600.2),
+    ["licorice lamprey"] = Vector3.new(-15110.6, 146.2, -9617.4),
+    ["candy corn pack"] = Vector3.new(-15100.9, 146.5, -9613.9),
+    ["pop-rock pufferfish"] = Vector3.new(-15098.1, 147.4, -9636.2),
+}
+-- Jawbreaker: posicao nao apareceu no log, portanto e localizado no mapa.
+local TREAT_LOCATIONS = {
+    Vector3.new(-15133.1, 145.5, -9604.1),
+    Vector3.new(-15140.9, 145.5, -9612.6),
+    Vector3.new(-15135.0, 145.5, -9622.9),
+}
 local Connections = {}
+local DebugLines = {}
+local TrackedText = setmetatable({}, {__mode = "k"})
+local PreparationTextState = setmetatable({}, {__mode = "k"})
+local WaitingForPreparation = nil
+local PreparationEvidence = nil
+local PreparedToken = nil
 local Enabled = false
 local Unloaded = false
 local Running = false
@@ -102,7 +129,41 @@ local function Connect(signal, callback)
 end
 
 local function Log(message)
-    print("[HAUNTED AUTO] " .. tostring(message))
+    local line = "[" .. os.date("%H:%M:%S") .. "] " .. tostring(message)
+    table.insert(DebugLines, line)
+    if #DebugLines > 180 then
+        table.remove(DebugLines, 1)
+    end
+    print("[HAUNTED AUTO v1.5] " .. line)
+end
+
+local function NormalizeText(raw)
+    local text = tostring(raw or ""):gsub("<.->", "")
+    local accents = {
+        ["á"] = "a", ["à"] = "a", ["ã"] = "a", ["â"] = "a",
+        ["é"] = "e", ["ê"] = "e", ["í"] = "i",
+        ["ó"] = "o", ["ô"] = "o", ["õ"] = "o", ["ú"] = "u", ["ç"] = "c",
+        ["Á"] = "a", ["À"] = "a", ["Ã"] = "a", ["Â"] = "a",
+        ["É"] = "e", ["Ê"] = "e", ["Í"] = "i",
+        ["Ó"] = "o", ["Ô"] = "o", ["Õ"] = "o", ["Ú"] = "u", ["Ç"] = "c",
+    }
+    for accented, plain in pairs(accents) do
+        text = text:gsub(accented, plain)
+    end
+    return text:lower():gsub("&nbsp;", " "):gsub("%s+", " "):match("^%s*(.-)%s*$")
+end
+
+local function PromptItemName(raw)
+    return NormalizeText(raw):gsub("^wants%s+", ""):gsub("^quer%s+", "")
+end
+
+local function HasAny(text, words)
+    for _, word in ipairs(words) do
+        if text:find(word, 1, true) then
+            return true
+        end
+    end
+    return false
 end
 
 local function GetCharacter()
@@ -241,30 +302,78 @@ local function FirePromptDirect(prompt)
     end)
 end
 
-local function TriggerPrompt(prompt, token)
-    if not prompt or not prompt.Parent then
+local function WaitForPromptChange(prompt, before, token)
+    local deadline = os.clock() + CONFIG.PROMPT_CONFIRM_TIMEOUT
+    local changedSince
+    while os.clock() < deadline and IsCurrent(token) do
+        local changed = not prompt.Parent or not prompt.Enabled
+            or prompt.ObjectText ~= before.object or prompt.ActionText ~= before.action
+        if changed then
+            changedSince = changedSince or os.clock()
+            if os.clock() - changedSince >= 0.45 then
+                return true
+            end
+        else
+            changedSince = nil
+        end
+        if not WaitCancelable(0.1, token) then
+            return false
+        end
+    end
+    return false
+end
+
+local function TriggerPrompt(prompt, token, verifyChange)
+    if not prompt or not prompt.Parent or not IsCurrent(token) then
         return false
     end
-
-    if token and not IsCurrent(token) then
-        return false
-    end
-
     if not TeleportNearObject(prompt) then
         return false
     end
-
-    -- O servidor precisa receber a nova posicao antes do prompt. Sem esta
-    -- pausa o prompt some no cliente, mas o servidor pode ignorar a acao.
     if not WaitCancelable(CONFIG.PROMPT_SYNC_WAIT, token) then
         return false
     end
 
-    if not FirePromptDirect(prompt) then
+    local readyDeadline = os.clock() + CONFIG.PROMPT_READY_TIMEOUT
+    while prompt.Parent and not prompt.Enabled and os.clock() < readyDeadline do
+        if not WaitCancelable(0.1, token) then
+            return false
+        end
+    end
+    if not IsCurrent(token) or not prompt.Parent or not prompt.Enabled then
         return false
     end
 
-    return WaitCancelable(CONFIG.PROMPT_AFTER_WAIT, token)
+    local attempts = verifyChange and CONFIG.PROMPT_ATTEMPTS or 1
+    local before = {object = prompt.ObjectText, action = prompt.ActionText}
+    for attempt = 1, attempts do
+        if not IsCurrent(token) then
+            return false
+        end
+        local fired
+        if attempt == 1 then
+            fired = FirePromptDirect(prompt)
+        else
+            fired = pcall(function()
+                prompt:InputHoldBegin()
+                WaitCancelable(math.max(prompt.HoldDuration, 0.05) + 0.15, token)
+                prompt:InputHoldEnd()
+            end)
+        end
+
+        if not WaitCancelable(CONFIG.PROMPT_AFTER_WAIT, token) then
+            return false
+        end
+        if verifyChange then
+            if WaitForPromptChange(prompt, before, token) then
+                return true
+            end
+        elseif fired then
+            return true
+        end
+        Log("Sem confirmacao no prompt: " .. tostring(before.object) .. " (tentativa " .. attempt .. ")")
+    end
+    return false
 end
 
 local function IsGuiVisible(object)
@@ -333,28 +442,54 @@ local function GetRitualComponents()
 end
 
 local function WaitForOfferingPrompt(objectText, timeout, token)
-    local finishAt = os.clock() + timeout
-
-    while os.clock() < finishAt do
-        if token and not IsCurrent(token) then
-            return nil
-        end
-
+    local deadline = os.clock() + timeout
+    local wanted = PromptItemName(objectText)
+    local triedPosition = false
+    local visited = {}
+    while os.clock() < deadline and IsCurrent(token) do
         local components = GetRitualComponents()
         if components then
             local prompt = FindPrompt(function(candidate)
-                return candidate.Enabled
-                    and string.lower(candidate.ObjectText)
-                        == string.lower(objectText)
+                return PromptItemName(candidate.ObjectText) == wanted
             end, components)
-
             if prompt then
+                -- Enabled pode depender da proximidade. TriggerPrompt aproxima
+                -- primeiro e espera a habilitacao, sem modificar o prompt.
                 return prompt
             end
         end
 
-        task.wait(0.15)
+        local position = OFFERING_LOCATIONS[wanted]
+        if position and not triedPosition then
+            triedPosition = true
+            TeleportTo(position + Vector3.new(0, 3, 2))
+            if not WaitCancelable(CONFIG.PROMPT_SYNC_WAIT, token) then
+                return nil
+            end
+        else
+            -- Se o nome so for preenchido ao chegar perto, percorre apenas os
+            -- prompts das lanternas/maos carregadas, nunca prompts de outros NPCs.
+            local target
+            local lanterns = components and components:FindFirstChild("Lanterns")
+            local hands = components and components:FindFirstChild("Hands")
+            local root = wanted == "bat wing" and hands or lanterns
+            if root then
+                target = FindPrompt(function(candidate)
+                    return not visited[candidate]
+                end, root)
+            end
+            if target then
+                visited[target] = true
+                TeleportNearObject(target)
+                if not WaitCancelable(0.35, token) then
+                    return nil
+                end
+            elseif not WaitCancelable(0.15, token) then
+                return nil
+            end
+        end
     end
+    return nil
 end
 
 -- Interface flutuante
@@ -421,7 +556,7 @@ stroke.Parent = ToggleButton
 
 local UnloadButton = Instance.new("TextButton")
 UnloadButton.Name = "Unload"
-UnloadButton.Size = UDim2.fromOffset(164, 23)
+UnloadButton.Size = UDim2.fromOffset(107, 23)
 UnloadButton.Position = UDim2.fromOffset(4, 53)
 UnloadButton.BackgroundColor3 = Color3.fromRGB(11, 11, 11)
 UnloadButton.TextColor3 = Color3.fromRGB(225, 85, 85)
@@ -435,6 +570,20 @@ local unloadCorner = Instance.new("UICorner")
 unloadCorner.CornerRadius = UDim.new(0, 6)
 unloadCorner.Parent = UnloadButton
 
+local LogButton = Instance.new("TextButton")
+LogButton.Name = "CopyLog"
+LogButton.Size = UDim2.fromOffset(53, 23)
+LogButton.Position = UDim2.fromOffset(115, 53)
+LogButton.BackgroundColor3 = Color3.fromRGB(11, 11, 11)
+LogButton.TextColor3 = Color3.fromRGB(190, 190, 190)
+LogButton.Text = "LOG"
+LogButton.TextSize = 10
+LogButton.Font = Enum.Font.GothamBold
+LogButton.Parent = Panel
+local logCorner = Instance.new("UICorner")
+logCorner.CornerRadius = UDim.new(0, 6)
+logCorner.Parent = LogButton
+
 local function SetStatus(status)
     CurrentStatus = tostring(status)
     if ToggleButton and ToggleButton.Parent then
@@ -443,12 +592,143 @@ local function SetStatus(status)
             and Color3.fromRGB(80, 235, 135)
             or Color3.fromRGB(210, 210, 210)
         ToggleButton.Text = string.format(
-            "HAUNTED: %s\n%s",
+            "HAUNTED v1.5: %s\n%s",
             Enabled and "ON" or "OFF",
             CurrentStatus
         )
     end
     Log(status)
+end
+
+-- Detecta a nova instrucao na tela. Nao aceita textos de templates/listas.
+-- A frase exata do jogo ainda nao foi fornecida: as regras abaixo sao
+-- heuristicas e o LOG registra texto + caminho para calibrar se necessario.
+local function IsPreparationInstruction(raw, path, isBottom)
+    local text = NormalizeText(raw)
+    path = NormalizeText(path)
+    if #text < 8 then
+        return false
+    end
+    if HasAny(path, {
+        ".options.", "scrollingframe", ".hotbar.", ".backpack.",
+        ".equipment.", ".showroom.", ".serverbrowser.", ".quests.",
+        "hauntedritualautogui",
+    }) then
+        return false
+    end
+    if HasAny(text, {
+        "cooldown", "not enough", "don't have", "do not have", "cannot", "can't",
+        "failed", "cancelled", "canceled", "expired", "ritual ended",
+        "ritual completed", "reward:", "recompensa:",
+        "nao pode", "nao possui", "nao tem", "falhou", "cancelado",
+        "ritual encerrado", "ritual concluido", "tempo esgotado",
+    }) then
+        return false
+    end
+    if HasAny(text, {
+        "hexing ritual", "scary relic ritual", "jack-o-moon ritual",
+        "boglin ritual", "dutchman's blessing", "haunted cemetery ritual",
+        "eldritch ritual", "omniscient ritual", "ghoul nessie ritual",
+    }) then
+        return false
+    end
+    local ritual = text:find("ritual", 1, true) ~= nil
+    local action = HasAny(text, {
+        "place", "placing", "offer", "light", "insert", "fill", "deposit",
+        "coloque", "colocar", "ofereca", "oferecer", "acenda", "acender",
+        "insira", "preencha", "deposite", "adicione",
+    })
+    local materials = HasAny(text, {
+        "offering", "ingredient", "lantern", "pumpkin", "treat", "items",
+        "skeletal hand", "skeleton hand", "bat wing",
+        "oferenda", "ingrediente", "abobora", "doce", "itens",
+    })
+    local noticePath = HasAny(path, {"announc", "notif", "ritual", "objective", "instruction"})
+    local hauntedStarted = (text:find("haunted ritual", 1, true)
+        or text:find("ritual assombrado", 1, true))
+        and HasAny(text, {"has begun", "has started", "begins", "started", "prepare", "iniciado", "comecou", "prepar"})
+    if hauntedStarted and (noticePath or isBottom) then
+        return true
+    end
+    return action and materials and (ritual or noticePath or isBottom)
+end
+
+local function ReadScreenText(object)
+    if not object.Parent or not IsGuiVisible(object) then
+        return object.Text or "", false, false
+    end
+    local size = object.AbsoluteSize
+    local visible = size.X > 1 and size.Y > 1 and object.TextTransparency < 0.98
+    local camera = workspace.CurrentCamera
+    local bottom = camera and (object.AbsolutePosition.Y + size.Y / 2)
+        >= camera.ViewportSize.Y * 0.42 or false
+    local current = object.Parent
+    while visible and current and current ~= PlayerGui do
+        if current:IsA("CanvasGroup") and current.GroupTransparency >= 0.98 then
+            visible = false
+        end
+        current = current.Parent
+    end
+    return object.Text or "", visible, bottom
+end
+
+local function CapturePreparation(raw, path, isBottom)
+    local token = WaitingForPreparation
+    if not token or not IsCurrent(token) or not IsPreparationInstruction(raw, path, isBottom) then
+        return false
+    end
+    if not PreparationEvidence then
+        PreparationEvidence = {token = token, at = os.clock(), text = raw, path = path}
+        Log("PREPARO DETECTADO | " .. path .. " | " .. raw)
+        SetStatus("Preparo detectado")
+    end
+    return true
+end
+
+local function ObservePreparationText(object)
+    local token = WaitingForPreparation
+    if not token or not IsCurrent(token) then
+        return
+    end
+    local raw, visible, bottom = ReadScreenText(object)
+    local previous = PreparationTextState[object]
+    PreparationTextState[object] = {text = raw, visible = visible}
+    local fresh = not previous or previous.text ~= raw or (visible and not previous.visible)
+    if not fresh or not visible or raw == "" then
+        return
+    end
+    local path = object:GetFullName()
+    if CapturePreparation(raw, path, bottom) then
+        return
+    end
+    local lower = NormalizeText(raw)
+    if (bottom or HasAny(lower, {"ritual", "ingredient", "oferenda", "abobora"}))
+        and not HasAny(NormalizeText(path), {".hotbar.", ".backpack.", "scrollingframe", ".options."})
+        and lower:find("%a") then
+        Log("UI visivel | " .. path .. " | " .. raw:sub(1, 350))
+    end
+end
+
+local function ScanPreparationTexts()
+    for object in pairs(TrackedText) do
+        if object.Parent then
+            ObservePreparationText(object)
+        end
+    end
+end
+
+local function ArmPreparationWatcher(token)
+    PreparationEvidence = nil
+    PreparedToken = nil
+    PreparationTextState = setmetatable({}, {__mode = "k"})
+    for object in pairs(TrackedText) do
+        if object.Parent then
+            local raw, visible = ReadScreenText(object)
+            PreparationTextState[object] = {text = raw, visible = visible}
+        end
+    end
+    WaitingForPreparation = token
+    Log("Detector armado; aguardando uma NOVA instrucao visivel de preparacao.")
 end
 
 local function ParseHouseMessage(rawText)
@@ -480,17 +760,24 @@ local function HookTextObject(object)
         return
     end
 
-    if not object:IsA("TextLabel") and not object:IsA("TextButton") then
+    if not object:IsA("TextLabel") and not object:IsA("TextButton")
+        and not object:IsA("TextBox") then
         return
     end
 
     HookedText[object] = true
+    TrackedText[object] = true
 
     Connect(object:GetPropertyChangedSignal("Text"), function()
-        if WaitingForHouse then
+        ObservePreparationText(object)
+        if WaitingForHouse and IsGuiVisible(object) then
             ParseHouseMessage(object.Text)
         end
     end)
+    Connect(object:GetPropertyChangedSignal("Visible"), function()
+        ObservePreparationText(object)
+    end)
+    ObservePreparationText(object)
 end
 
 for _, object in ipairs(PlayerGui:GetDescendants()) do
@@ -501,6 +788,7 @@ Connect(PlayerGui.DescendantAdded, HookTextObject)
 
 pcall(function()
     Connect(TextChatService.MessageReceived, function(message)
+        CapturePreparation(message.Text, "TextChatService.Notification", false)
         if WaitingForHouse then
             ParseHouseMessage(message.Text)
         end
@@ -655,210 +943,136 @@ local function FindFrankensteinPrompt()
     end)
 end
 
--- Espera os prompts reais, sem tentar clicar no NPC ou nas opcoes do dialogo.
-local function ReadHauntedRitualSetup()
-    local components = GetRitualComponents()
-    local found = {}
-    local pedestals = {}
-    local required = {["wants bat wing"] = true}
-    for _, name in ipairs(OFFERINGS) do
-        required[string.lower(name)] = true
-    end
-
-    if components then
-        for _, object in ipairs(components:GetDescendants()) do
-            if object:IsA("ProximityPrompt") and object.Enabled then
-                local label = string.lower(object.ObjectText or "")
-                local action = string.lower(object.ActionText or "")
-                if required[label] then
-                    found[label] = object
-                elseif label == "treat pedestal"
-                    and string.find(action, "fill", 1, true)
-                    and tonumber(string.match(action, "%d+")) == 50 then
-                    table.insert(pedestals, object)
-                end
-            end
-        end
-    end
-
-    local offeringCount = 0
-    for label in pairs(required) do
-        if found[label] then
-            offeringCount = offeringCount + 1
-        end
-    end
-    local setup
-    if offeringCount == #OFFERINGS + 1 and #pedestals == 3 then
-        setup = {components = components, offerings = found, pedestals = pedestals}
-    end
-    return setup, offeringCount, #pedestals
-end
-
-local function SameHauntedSetup(first, second)
-    if not first or not second or first.components ~= second.components then
-        return false
-    end
-    for label, prompt in pairs(first.offerings) do
-        if second.offerings[label] ~= prompt then
-            return false
-        end
-    end
-    local pedestalSet = {}
-    for _, prompt in ipairs(first.pedestals) do
-        pedestalSet[prompt] = true
-    end
-    for _, prompt in ipairs(second.pedestals) do
-        if not pedestalSet[prompt] then
-            return false
-        end
-    end
-    return true
-end
-
 local function StartHauntedRitual(token)
     if not IsCurrent(token) then
         return false, "Cancelado"
     end
+    -- Arma antes do TP: nao perde notificacao durante a chegada/sincronizacao.
+    ArmPreparationWatcher(token)
     SetStatus("Indo ao Frankenstein")
     local prompt = FindFrankensteinPrompt()
     local moved = prompt and TeleportNearObject(prompt)
     if not moved then
         moved = TeleportTo(Vector3.new(-15107.4, 151.6, -9620.4))
     end
-    if not moved then
-        return false, "Nao consegui chegar ao Frankenstein"
+    if not moved or not WaitCancelable(CONFIG.PROMPT_SYNC_WAIT, token) then
+        WaitingForPreparation = nil
+        return false, "Cancelado ou TP indisponivel"
     end
-    if not WaitCancelable(CONFIG.PROMPT_SYNC_WAIT, token) then
-        return false, "Cancelado"
-    end
-
     local _, _, humanoid = GetCharacter()
     if not IsCurrent(token) then
+        WaitingForPreparation = nil
         return false, "Cancelado"
     end
     if humanoid then
         humanoid:UnequipTools()
     end
-    SetStatus("Fale com Frankenstein")
-    Log("Escolha Haunted Ritual manualmente. Vou esperar as oferendas aparecerem.")
-
-    local candidate
-    local candidateSince
-    local lastStatus
+    SetStatus("Inicie Haunted no NPC")
+    Log("Fale manualmente, escolha Haunted Ritual e espere a mensagem de colocar os ingredientes.")
     while IsCurrent(token) do
-        local setup, offeringCount, pedestalCount = ReadHauntedRitualSetup()
-        if setup then
-            if not SameHauntedSetup(candidate, setup) then
-                candidate = setup
-                candidateSince = os.clock()
-            elseif os.clock() - candidateSince >= CONFIG.MANUAL_RITUAL_STABLE_TIME then
-                if not IsCurrent(token) then
-                    return false, "Cancelado"
-                end
-                SetStatus("Haunted detectado")
-                Log("Confirmado: Bat Wing, 7 oferendas e 3 pedestais de 50 Treats.")
-                return true
-            end
-        else
-            candidate = nil
-            candidateSince = nil
+        ScanPreparationTexts()
+        local evidence = PreparationEvidence
+        if evidence and evidence.token == token then
+            WaitingForPreparation = nil
+            PreparedToken = token
+            Log("Prosseguindo pela mensagem: " .. evidence.text)
+            return true
         end
-
-        local status
-        if offeringCount == 0 and pedestalCount == 0 then
-            status = "Fale com Frankenstein"
-        else
-            status = string.format("Aguardando: %d/8 + %d/3", offeringCount, pedestalCount)
-        end
-        if lastStatus ~= status then
-            lastStatus = status
-            SetStatus(status)
-        end
-        -- Sem timeout e sem novos TPs durante a conversa.
         if not WaitCancelable(CONFIG.MANUAL_RITUAL_POLL, token) then
-            return false, "Cancelado"
+            break
         end
     end
+    WaitingForPreparation = nil
     return false, "Cancelado"
 end
 
 local function PlaceOneOffering(objectText, label, token)
     SetStatus("Colocando " .. label)
 
-    local prompt = WaitForOfferingPrompt(objectText, 7, token)
+    local prompt = WaitForOfferingPrompt(objectText, 12, token)
     if not prompt then
         return false, "Não achei prompt: " .. objectText
     end
 
-    if not TriggerPrompt(prompt, token) then
-        return false, "Falha ao acionar: " .. objectText
+    if not TriggerPrompt(prompt, token, true) then
+        return false, "Sem confirmacao da oferenda: " .. objectText .. " (veja LOG)"
     end
 
     return true
 end
 
-local function PlaceAllOfferings(token)
-    if not IsCurrent(token) then
-        return false, "Cancelado"
+local function FindTreatPedestals(token)
+    local result, seen = {}, {}
+    local function collect()
+        local components = GetRitualComponents()
+        if not components then return end
+        for _, prompt in ipairs(FindPrompts(function(candidate)
+            local action = NormalizeText(candidate.ActionText)
+            return NormalizeText(candidate.ObjectText) == "treat pedestal"
+                and tonumber(action:match("%d+")) == 50
+        end, components)) do
+            if not seen[prompt] then
+                seen[prompt] = true
+                table.insert(result, prompt)
+            end
+        end
     end
-    local setup = ReadHauntedRitualSetup()
-    if not setup then
-        return false, "Os prompts do Haunted mudaram; selecione o ritual novamente"
+    collect()
+    if #result < 3 then
+        for _, position in ipairs(TREAT_LOCATIONS) do
+            if not IsCurrent(token) then return {} end
+            TeleportTo(position + Vector3.new(0, 3, 2))
+            if not WaitCancelable(0.5, token) then return {} end
+            collect()
+            if #result >= 3 then break end
+        end
+    end
+    return result
+end
+
+local function PlaceAllOfferings(token)
+    if not IsCurrent(token) or PreparedToken ~= token or not PreparationEvidence
+        or PreparationEvidence.token ~= token then
+        return false, "Sem mensagem de preparacao confirmada"
+    end
+    if os.clock() - PreparationEvidence.at > CONFIG.PREPARATION_MAX_AGE then
+        return false, "A mensagem de preparacao expirou; inicie novamente"
     end
 
     local ok, reason = PlaceOneOffering("Wants Bat Wing", "Bat Wing", token)
-    if not ok then
-        return false, reason
-    end
-
+    if not ok then return false, reason end
     for _, offering in ipairs(OFFERINGS) do
         ok, reason = PlaceOneOffering(offering, offering, token)
-        if not ok then
-            return false, reason
-        end
+        if not ok then return false, reason end
     end
 
-    -- Treats somente depois de todas as oferendas, conforme observado.
-    SetStatus("Conferindo pedestais de Treats")
-    local components = GetRitualComponents()
-    if not components then
-        return false, "RitualComponents desapareceu"
+    SetStatus("Conferindo os Treats")
+    local pedestals = FindTreatPedestals(token)
+    if not IsCurrent(token) then return false, "Cancelado" end
+    if #pedestals ~= 3 then
+        return false, "Encontrei " .. #pedestals .. "/3 pedestais de 50 Treats (veja LOG)"
     end
 
-    local pedestals = FindPrompts(function(prompt)
-        return prompt.Enabled
-            and string.lower(prompt.ObjectText) == "treat pedestal"
-            and string.find(string.lower(prompt.ActionText), "50", 1, true)
-    end, components)
-
-    if #pedestals < 3 then
-        return false, "Só encontrei " .. #pedestals .. "/3 pedestais de Treats"
-    end
-
-    -- A mensagem com o número pode aparecer no mesmo instante do último
-    -- pedestal. Começa a escutar antes para não perder esse aviso.
     WaitingForHouse = true
     DetectedHouse = nil
-
     table.sort(pedestals, function(a, b)
         local positionA = GetWorldPosition(a)
         local positionB = GetWorldPosition(b)
         if not positionA or not positionB then
             return a:GetFullName() < b:GetFullName()
         end
-        if positionA.X == positionB.X then
-            return positionA.Z < positionB.Z
-        end
+        if positionA.X == positionB.X then return positionA.Z < positionB.Z end
         return positionA.X < positionB.X
     end)
 
-    for index = 1, 3 do
+    for index, pedestal in ipairs(pedestals) do
         SetStatus("Treat Pedestal " .. index .. "/3")
-        if not TriggerPrompt(pedestals[index], token) then
-            return false, "Falha no Treat Pedestal " .. index
+        if not TriggerPrompt(pedestal, token, true) then
+            WaitingForHouse = false
+            return false, "Sem confirmacao no Treat Pedestal " .. index .. " (veja LOG)"
         end
     end
-
+    PreparedToken = nil
     LastRitualActivation = os.clock()
     return true
 end
@@ -1134,7 +1348,7 @@ local function FindPreferredRod()
 end
 
 local function TryExitSpiritRealm(houseNumber, token)
-    if not CONFIG.AUTO_EXIT_WITH_ROD then
+    if not IsCurrent(token) or not CONFIG.AUTO_EXIT_WITH_ROD then
         return false
     end
 
@@ -1164,7 +1378,9 @@ local function TryExitSpiritRealm(houseNumber, token)
             end)
         end
 
-        WaitCancelable(1.4, token)
+        if not WaitCancelable(1.4, token) then
+            return false
+        end
 
         local _, _, humanoid = GetCharacter()
         if humanoid then
@@ -1172,7 +1388,9 @@ local function TryExitSpiritRealm(houseNumber, token)
         end
     end
 
-    WaitCancelable(2.0, token)
+    if not WaitCancelable(2.0, token) then
+        return false
+    end
 
     local _, root = GetCharacter()
     local outsidePosition = HOUSE_POSITIONS[houseNumber]
@@ -1215,7 +1433,9 @@ local function VisitHauntedHouse(number, token)
         return false, "Não consegui equipar Candy Bucket"
     end
 
-    WaitCancelable(0.35, token)
+    if not WaitCancelable(0.35, token) then
+        return false, "Cancelado"
+    end
     SetStatus("Knock na House " .. number)
     TriggerPrompt(doorPrompt, token)
 
@@ -1254,7 +1474,9 @@ local function VisitHauntedHouse(number, token)
         return false, "GhostMinigame não foi concluído"
     end
 
-    WaitCancelable(1.0, token)
+    if not WaitCancelable(1.0, token) then
+        return false, "Cancelado"
+    end
     TryExitSpiritRealm(number, token)
     return true
 end
@@ -1371,6 +1593,8 @@ local function SetEnabled(state)
         end)
     else
         WaitingForHouse = false
+        WaitingForPreparation = nil
+        PreparedToken = nil
         SetStatus("Desligado")
     end
 end
@@ -1463,6 +1687,10 @@ Env.HAUNTED_AUTO_ONE_CYCLE = function()
         local ok, success, reason = pcall(RunOneCycle, token)
         Running = false
 
+        if Unloaded or token ~= Generation then
+            return
+        end
+
         if not ok then
             SetStatus("Erro no ciclo único")
             warn(success)
@@ -1481,6 +1709,8 @@ Env.HAUNTED_AUTO_STOP = function()
     Enabled = false
     Generation = Generation + 1
     WaitingForHouse = false
+    WaitingForPreparation = nil
+    PreparedToken = nil
 
     for _, connection in ipairs(Connections) do
         pcall(function()
@@ -1504,6 +1734,24 @@ Connect(UnloadButton.Activated, function()
     end
 end)
 
+local function CopyDebugLog()
+    local text = "HAUNTED AUTO v1.5\n" .. table.concat(DebugLines, "\n")
+    if setclipboard then
+        local ok = pcall(setclipboard, text)
+        if ok then
+            LogButton.Text = "COPIADO"
+            task.delay(1.5, function()
+                if not Unloaded and LogButton.Parent then LogButton.Text = "LOG" end
+            end)
+            return
+        end
+    end
+    print(text)
+    LogButton.Text = "CONSOLE"
+end
+Env.HAUNTED_AUTO_COPY_LOG = CopyDebugLog
+Connect(LogButton.Activated, CopyDebugLog)
+
 SetStatus("Desligado")
-Log("v1.4 carregado. Ligue e fale com Frankenstein; selecione Haunted Ritual manualmente.")
+Log("v1.5: ligue ANTES de falar com Frankenstein. O LOG copia o texto real detectado.")
 
