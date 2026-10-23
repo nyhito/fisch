@@ -1,5 +1,5 @@
 --[[
-    FischFright 3 - Haunted Ritual Auto v1
+    FischFright 3 - Haunted Ritual Auto v1.2 Mobile
 
     Fluxo observado no jogo:
       Frankenstein -> option 2 -> option 3 (Haunted Ritual)
@@ -44,6 +44,9 @@ local CONFIG = {
     AUTO_GHOST = true,
     AUTO_EXIT_WITH_ROD = true,
     USE_MIRROR_FALLBACK = true,
+    PROMPT_SYNC_WAIT = 0.90,
+    PROMPT_AFTER_WAIT = 0.75,
+    FRANKENSTEIN_RETRIES = 4,
 }
 
 Env.HAUNTED_AUTO_CONFIG = CONFIG
@@ -194,6 +197,44 @@ local function FindPrompts(predicate, root)
     return result
 end
 
+local function FirePromptDirect(prompt)
+    if not prompt or not prompt.Parent then
+        return false
+    end
+
+    -- fireproximityprompt aciona o prompt diretamente e funciona no mobile
+    -- sem depender do botao E ou da interface de toque do Roblox.
+    if fireproximityprompt then
+        local ok = pcall(function()
+            fireproximityprompt(prompt, math.max(prompt.HoldDuration, 0))
+        end)
+        if ok then
+            return true
+        end
+    end
+
+    -- Segundo metodo direto para executores sem fireproximityprompt.
+    local holdOk = pcall(function()
+        prompt:InputHoldBegin()
+        task.wait(math.max(prompt.HoldDuration, 0.05) + 0.05)
+        prompt:InputHoldEnd()
+    end)
+    if holdOk then
+        return true
+    end
+
+    -- Ultimo fallback. Alguns executores mobile aceitam a tecla virtual.
+    return pcall(function()
+        local key = prompt.KeyboardKeyCode
+        if key == Enum.KeyCode.Unknown then
+            key = Enum.KeyCode.E
+        end
+        VirtualInputManager:SendKeyEvent(true, key, false, game)
+        task.wait(math.max(prompt.HoldDuration, 0.05) + 0.05)
+        VirtualInputManager:SendKeyEvent(false, key, false, game)
+    end)
+end
+
 local function TriggerPrompt(prompt, token)
     if not prompt or not prompt.Parent then
         return false
@@ -203,28 +244,21 @@ local function TriggerPrompt(prompt, token)
         return false
     end
 
-    TeleportNearObject(prompt)
-    if not WaitCancelable(0.35, token) then
+    if not TeleportNearObject(prompt) then
         return false
     end
 
-    local succeeded = false
-
-    if fireproximityprompt then
-        succeeded = pcall(function()
-            fireproximityprompt(prompt, 0)
-        end)
+    -- O servidor precisa receber a nova posicao antes do prompt. Sem esta
+    -- pausa o prompt some no cliente, mas o servidor pode ignorar a acao.
+    if not WaitCancelable(CONFIG.PROMPT_SYNC_WAIT, token) then
+        return false
     end
 
-    if not succeeded then
-        pcall(function()
-            VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
-            task.wait(0.05)
-            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
-        end)
+    if not FirePromptDirect(prompt) then
+        return false
     end
 
-    return WaitCancelable(0.65, token)
+    return WaitCancelable(CONFIG.PROMPT_AFTER_WAIT, token)
 end
 
 local function IsGuiVisible(object)
@@ -246,6 +280,17 @@ end
 local function ClickGui(button)
     if not button or not button.Parent or not IsGuiVisible(button) then
         return false
+    end
+
+    -- Aciona diretamente os sinais do botao quando o executor permite.
+    -- Isso evita depender de mouse em aparelhos mobile.
+    if firesignal then
+        local activated = pcall(function()
+            firesignal(button.MouseButton1Click)
+        end)
+        if activated then
+            return true
+        end
     end
 
     local center = button.AbsolutePosition + button.AbsoluteSize / 2
@@ -347,18 +392,38 @@ ScreenGui.ResetOnSpawn = false
 ScreenGui.IgnoreGuiInset = true
 ScreenGui.Parent = GuiParent
 
+local Panel = Instance.new("Frame")
+Panel.Name = "Panel"
+Panel.Size = UDim2.fromOffset(172, 80)
+Panel.Position = UDim2.new(1, -192, 0.38, 0)
+Panel.BackgroundColor3 = Color3.fromRGB(5, 5, 5)
+Panel.BackgroundTransparency = 0.06
+Panel.BorderSizePixel = 0
+Panel.Active = true
+Panel.Parent = ScreenGui
+
+local panelCorner = Instance.new("UICorner")
+panelCorner.CornerRadius = UDim.new(0, 10)
+panelCorner.Parent = Panel
+
+local panelStroke = Instance.new("UIStroke")
+panelStroke.Color = Color3.fromRGB(70, 70, 70)
+panelStroke.Transparency = 0.15
+panelStroke.Thickness = 1
+panelStroke.Parent = Panel
+
 local ToggleButton = Instance.new("TextButton")
 ToggleButton.Name = "Toggle"
-ToggleButton.Size = UDim2.fromOffset(190, 72)
-ToggleButton.Position = UDim2.new(1, -210, 0.38, 0)
-ToggleButton.BackgroundColor3 = Color3.fromRGB(155, 45, 45)
-ToggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
-ToggleButton.TextSize = 13
+ToggleButton.Size = UDim2.fromOffset(164, 45)
+ToggleButton.Position = UDim2.fromOffset(4, 4)
+ToggleButton.BackgroundColor3 = Color3.fromRGB(13, 13, 13)
+ToggleButton.TextColor3 = Color3.fromRGB(210, 210, 210)
+ToggleButton.TextSize = 12
 ToggleButton.TextWrapped = true
 ToggleButton.Font = Enum.Font.GothamBold
 ToggleButton.AutoButtonColor = false
 ToggleButton.Active = true
-ToggleButton.Parent = ScreenGui
+ToggleButton.Parent = Panel
 
 local corner = Instance.new("UICorner")
 corner.CornerRadius = UDim.new(0, 12)
@@ -366,18 +431,35 @@ corner.Parent = ToggleButton
 
 local stroke = Instance.new("UIStroke")
 stroke.Color = Color3.fromRGB(255, 255, 255)
-stroke.Transparency = 0.55
-stroke.Thickness = 1.5
+stroke.Transparency = 0.82
+stroke.Thickness = 1
 stroke.Parent = ToggleButton
+
+local UnloadButton = Instance.new("TextButton")
+UnloadButton.Name = "Unload"
+UnloadButton.Size = UDim2.fromOffset(164, 23)
+UnloadButton.Position = UDim2.fromOffset(4, 53)
+UnloadButton.BackgroundColor3 = Color3.fromRGB(11, 11, 11)
+UnloadButton.TextColor3 = Color3.fromRGB(225, 85, 85)
+UnloadButton.Text = "UNLOAD"
+UnloadButton.TextSize = 10
+UnloadButton.Font = Enum.Font.GothamBold
+UnloadButton.AutoButtonColor = true
+UnloadButton.Parent = Panel
+
+local unloadCorner = Instance.new("UICorner")
+unloadCorner.CornerRadius = UDim.new(0, 6)
+unloadCorner.Parent = UnloadButton
 
 local function SetStatus(status)
     CurrentStatus = tostring(status)
     if ToggleButton and ToggleButton.Parent then
-        ToggleButton.BackgroundColor3 = Enabled
-            and Color3.fromRGB(35, 160, 85)
-            or Color3.fromRGB(155, 45, 45)
+        ToggleButton.BackgroundColor3 = Color3.fromRGB(13, 13, 13)
+        ToggleButton.TextColor3 = Enabled
+            and Color3.fromRGB(80, 235, 135)
+            or Color3.fromRGB(210, 210, 210)
         ToggleButton.Text = string.format(
-            "AUTO HAUNTED: %s\n%s",
+            "HAUNTED: %s\n%s",
             Enabled and "ON" or "OFF",
             CurrentStatus
         )
@@ -582,29 +664,99 @@ local function TourHousesForHaunt(token)
     return nil
 end
 
-local function StartHauntedRitual(token)
-    SetStatus("Indo ao Frankenstein")
-
-    TeleportTo(Vector3.new(-15107.4, 151.6, -9620.4))
-    WaitCancelable(0.6, token)
-
-    local frankenstein = FindPrompt(function(prompt)
+local function FindFrankensteinPrompt()
+    return FindPrompt(function(prompt)
         return string.lower(prompt.ObjectText) == "frankenstein"
             and string.lower(prompt.ActionText) == "talk"
     end)
+end
 
-    if not frankenstein then
-        return false, "Prompt do Frankenstein não carregou"
+local function WaitForFrankensteinPrompt(timeout, token)
+    local finishAt = os.clock() + timeout
+
+    while os.clock() < finishAt do
+        if not IsCurrent(token) then
+            return nil
+        end
+
+        local prompt = FindFrankensteinPrompt()
+        if prompt and prompt.Parent and prompt.Enabled then
+            return prompt
+        end
+
+        task.wait(0.15)
+    end
+end
+
+local function OpenFrankensteinDialogue(token)
+    -- Se a caixa ja estiver aberta, nao toca novamente no NPC.
+    local alreadyOpen = WaitForOption(2, 0.25, token)
+    if alreadyOpen then
+        return alreadyOpen
     end
 
-    TriggerPrompt(frankenstein, token)
-    SetStatus("Abrindo lista de rituais")
+    for attempt = 1, CONFIG.FRANKENSTEIN_RETRIES do
+        if not IsCurrent(token) then
+            return nil, "Cancelado"
+        end
 
-    local option2 = WaitForOption(2, 6, token)
+        SetStatus(string.format(
+            "Falando com Frankenstein %d/%d",
+            attempt,
+            CONFIG.FRANKENSTEIN_RETRIES
+        ))
+
+        local _, _, humanoid = GetCharacter()
+        if humanoid then
+            humanoid:UnequipTools()
+        end
+
+        local prompt = WaitForFrankensteinPrompt(4, token)
+        if not prompt then
+            TeleportTo(Vector3.new(-15107.4, 151.6, -9620.4))
+            WaitCancelable(1.0, token)
+            prompt = WaitForFrankensteinPrompt(3, token)
+        end
+
+        if prompt then
+            -- TriggerPrompt espera o teleporte sincronizar e aciona o prompt
+            -- diretamente, sem depender do botao mobile na tela.
+            TriggerPrompt(prompt, token)
+
+            local option2 = WaitForOption(2, 7, token)
+            if option2 then
+                return option2
+            end
+        end
+
+        -- Quando a tentativa e ignorada pelo servidor, o prompt pode sumir
+        -- por um instante. Espera ele voltar antes de repetir.
+        WaitCancelable(1.2, token)
+    end
+
+    return nil, "Diálogo do Frankenstein não abriu após as tentativas"
+end
+
+local function StartHauntedRitual(token)
+    SetStatus("Indo ao Frankenstein")
+
+    -- Se o ritual ja estiver ativo, pula completamente o dialogo.
+    local activePrompt = WaitForOfferingPrompt("Wants Bat Wing", 0.25, token)
+        or WaitForOfferingPrompt("Sour Patch Salmon", 0.25, token)
+    if activePrompt then
+        SetStatus("Ritual já ativo")
+        return true
+    end
+
+    TeleportTo(Vector3.new(-15107.4, 151.6, -9620.4))
+    WaitCancelable(1.0, token)
+
+    local option2, dialogueReason = OpenFrankensteinDialogue(token)
     if not option2 then
-        return false, "Opção 2 do Frankenstein não apareceu"
+        return false, dialogueReason or "Diálogo do Frankenstein não abriu"
     end
 
+    SetStatus("Abrindo lista de rituais")
     ClickGui(option2)
     WaitCancelable(1.3, token)
 
@@ -1223,7 +1375,7 @@ Connect(ToggleButton.InputBegan, function(input)
     Dragging = true
     Moved = false
     DragStart = input.Position
-    StartPosition = ToggleButton.Position
+    StartPosition = Panel.Position
     ActiveInput = input
 
     local endConnection
@@ -1259,7 +1411,7 @@ Connect(UserInputService.InputChanged, function(input)
         Moved = true
     end
 
-    ToggleButton.Position = UDim2.new(
+    Panel.Position = UDim2.new(
         StartPosition.X.Scale,
         StartPosition.X.Offset + delta.X,
         StartPosition.Y.Scale,
@@ -1323,6 +1475,13 @@ Env.HAUNTED_AUTO_STOP = function()
 
     print("[HAUNTED AUTO] Script encerrado.")
 end
+
+Connect(UnloadButton.Activated, function()
+    -- Interrompe imediatamente o ciclo, invalida o token atual e remove o GUI.
+    if Env.HAUNTED_AUTO_STOP then
+        Env.HAUNTED_AUTO_STOP()
+    end
+end)
 
 SetStatus("Desligado")
 Log("Carregado. Toque no botão flutuante para iniciar.")
