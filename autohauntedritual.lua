@@ -1,8 +1,9 @@
 --[[
-    FischFright 3 - Haunted Ritual Auto v1.3 Mobile
+    FischFright 3 - Haunted Ritual Auto v1.4 Mobile (dialogo manual)
 
     Fluxo observado no jogo:
-      Frankenstein -> option 2 -> option 3 (Haunted Ritual)
+      TP ao Frankenstein -> jogador escolhe Haunted Ritual manualmente
+      Espera os prompts reais de 8 oferendas + 3 pedestais de 50 Treats
       Bat Wing -> 7 Jack-o-Lantern offerings -> 3 pedestais de 50 Treats
       Detecta House XXX -> equipa Candy Bucket -> Knock
       Tenta acompanhar o alvo do GhostMinigame -> tenta sair usando uma vara
@@ -12,13 +13,15 @@
         movel nao apareceu no log. O script procura o elemento que se move.
       * Cada ciclo consome os itens do Haunted Ritual e 150 Treats.
       * Toque no botao flutuante para ligar/desligar. Arraste para mover.
+      * Fale com Frankenstein em cada ciclo; o script nao toca no dialogo.
+      * A espera manual nao tem limite. OFF/UNLOAD cancelam a espera.
+      * O detector usa os prompts observados, nao remotes ou atributos inventados.
 ]]
 
 local Players = game:GetService("Players")
 local TextChatService = game:GetService("TextChatService")
 local UserInputService = game:GetService("UserInputService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
-local ProximityPromptService = game:GetService("ProximityPromptService")
 local RunService = game:GetService("RunService")
 local CoreGui = game:GetService("CoreGui")
 
@@ -47,7 +50,8 @@ local CONFIG = {
     USE_MIRROR_FALLBACK = true,
     PROMPT_SYNC_WAIT = 0.90,
     PROMPT_AFTER_WAIT = 0.75,
-    FRANKENSTEIN_RETRIES = 4,
+    MANUAL_RITUAL_POLL = 0.25,
+    MANUAL_RITUAL_STABLE_TIME = 0.8,
 }
 
 Env.HAUNTED_AUTO_CONFIG = CONFIG
@@ -83,6 +87,7 @@ local OFFERINGS = {
 
 local Connections = {}
 local Enabled = false
+local Unloaded = false
 local Running = false
 local Generation = 0
 local WaitingForHouse = false
@@ -109,7 +114,7 @@ local function GetCharacter()
 end
 
 local function IsCurrent(token)
-    return Enabled and token == Generation
+    return not Unloaded and Enabled and token == Generation
 end
 
 local function WaitCancelable(seconds, token)
@@ -318,258 +323,6 @@ local function ClickGui(button)
     end)
 
     return ok
-end
-
-local function WaitForOption(number, timeout, token)
-    local finishAt = os.clock() + timeout
-    local optionName = tostring(number) .. "option"
-
-    while os.clock() < finishAt do
-        if token and not IsCurrent(token) then
-            return nil
-        end
-
-        local options = PlayerGui:FindFirstChild("options")
-        local safezone = options and options:FindFirstChild("safezone")
-        local option = safezone and safezone:FindFirstChild(optionName)
-        local button = option and option:FindFirstChild("button")
-
-        if button and button:IsA("GuiButton") and IsGuiVisible(button) then
-            return button
-        end
-
-        task.wait(0.1)
-    end
-end
-
-local function FireConnections(signal, ...)
-    if not getconnections then
-        return false
-    end
-
-    local ok, connections = pcall(getconnections, signal)
-    if not ok or type(connections) ~= "table" then
-        return false
-    end
-
-    local fired = false
-    local arguments = {...}
-
-    for _, connection in ipairs(connections) do
-        if connection.Enabled ~= false then
-            local connectionOk = false
-
-            if connection.Fire then
-                connectionOk = pcall(function()
-                    connection:Fire(table.unpack(arguments))
-                end)
-            elseif connection.Function then
-                connectionOk = pcall(function()
-                    connection.Function(table.unpack(arguments))
-                end)
-            end
-
-            fired = connectionOk or fired
-        end
-    end
-
-    return fired
-end
-
-local function FireEngineSignal(signal, ...)
-    local arguments = {...}
-
-    -- Prefere chamar as conexoes reais do Dialog quando o executor expoe
-    -- getconnections. Assim nao aceitamos um firesignal vazio como sucesso.
-    if FireConnections(signal, table.unpack(arguments)) then
-        return true
-    end
-
-    if firesignal then
-        local ok = pcall(function()
-            firesignal(signal, table.unpack(arguments))
-        end)
-        if ok then
-            return true
-        end
-    end
-
-    return false
-end
-
-local function ClickPromptGuiForFrankenstein()
-    local bestObject = nil
-    local bestScore = 0
-
-    for _, object in ipairs(PlayerGui:GetDescendants()) do
-        if (object:IsA("TextLabel") or object:IsA("TextButton"))
-            and IsGuiVisible(object) then
-            local text = string.lower(object.Text or "")
-            local score = 0
-
-            if string.find(text, "frankenstein", 1, true) then
-                score = score + 100
-            end
-            if string.find(text, "talk", 1, true) then
-                score = score + 50
-            end
-
-            if score > bestScore then
-                bestScore = score
-                bestObject = object
-            end
-        end
-    end
-
-    if not bestObject then
-        return false
-    end
-
-    local clickable = bestObject
-    local current = bestObject
-
-    for _ = 1, 5 do
-        if current:IsA("GuiButton") then
-            clickable = current
-            break
-        end
-        if not current.Parent or not current.Parent:IsA("GuiObject") then
-            break
-        end
-        current = current.Parent
-        clickable = current
-    end
-
-    local center = clickable.AbsolutePosition + clickable.AbsoluteSize / 2
-    local touched = pcall(function()
-        VirtualInputManager:SendTouchEvent(0, 0, center.X, center.Y)
-        task.wait(0.08)
-        VirtualInputManager:SendTouchEvent(0, 2, center.X, center.Y)
-    end)
-
-    pcall(function()
-        VirtualInputManager:SendMouseMoveEvent(center.X, center.Y, game)
-        VirtualInputManager:SendMouseButtonEvent(
-            center.X,
-            center.Y,
-            0,
-            true,
-            game,
-            0
-        )
-        task.wait(0.08)
-        VirtualInputManager:SendMouseButtonEvent(
-            center.X,
-            center.Y,
-            0,
-            false,
-            game,
-            0
-        )
-    end)
-
-    return touched or true
-end
-
-local function PressPromptKey(prompt)
-    local key = prompt.KeyboardKeyCode
-    if key == Enum.KeyCode.Unknown then
-        key = Enum.KeyCode.E
-    end
-
-    return pcall(function()
-        VirtualInputManager:SendKeyEvent(true, key, false, game)
-        task.wait(math.max(prompt.HoldDuration, 0.05) + 0.08)
-        VirtualInputManager:SendKeyEvent(false, key, false, game)
-    end)
-end
-
-local function TryFrankensteinMethod(prompt, label, callback, token, waitTime)
-    if not IsCurrent(token) then
-        return nil
-    end
-
-    SetStatus("Frankenstein: " .. label)
-    Log("Tentando interação: " .. label)
-
-    local ok, attempted = pcall(callback)
-    if not ok then
-        Log("Método falhou: " .. label .. " | " .. tostring(attempted))
-    end
-
-    return WaitForOption(2, waitTime or 2.5, token)
-end
-
-local function TriggerFrankensteinDialogue(prompt, token)
-    local option2
-
-    -- O Dialog do Fisch pode escutar diretamente prompt.Triggered.
-    option2 = TryFrankensteinMethod(prompt, "sinal direto", function()
-        return FireEngineSignal(prompt.Triggered, Player)
-    end, token, 2.5)
-    if option2 then
-        return option2
-    end
-
-    -- Algumas versoes usam o evento central do ProximityPromptService.
-    option2 = TryFrankensteinMethod(prompt, "sinal global", function()
-        return FireEngineSignal(
-            ProximityPromptService.PromptTriggered,
-            prompt,
-            Player
-        )
-    end, token, 2.5)
-    if option2 then
-        return option2
-    end
-
-    -- Tenta a funcao do executor sem parametros extras.
-    option2 = TryFrankensteinMethod(prompt, "prompt direto", function()
-        if not fireproximityprompt then
-            return false
-        end
-        return pcall(function()
-            fireproximityprompt(prompt)
-        end)
-    end, token, 3.5)
-    if option2 then
-        return option2
-    end
-
-    -- Alguns executores mobile exigem a assinatura com SkipHold=true.
-    option2 = TryFrankensteinMethod(prompt, "prompt forçado", function()
-        if not fireproximityprompt then
-            return false
-        end
-        return pcall(function()
-            fireproximityprompt(prompt, 0, true)
-        end)
-    end, token, 3.5)
-    if option2 then
-        return option2
-    end
-
-    -- Ultimos fallbacks: toca no GUI mobile, simula o hold e envia a tecla.
-    option2 = TryFrankensteinMethod(prompt, "toque mobile", function()
-        return ClickPromptGuiForFrankenstein()
-    end, token, 2.5)
-    if option2 then
-        return option2
-    end
-
-    option2 = TryFrankensteinMethod(prompt, "hold direto", function()
-        prompt:InputHoldBegin()
-        task.wait(math.max(prompt.HoldDuration, 0.05) + 0.08)
-        prompt:InputHoldEnd()
-        return true
-    end, token, 2.5)
-    if option2 then
-        return option2
-    end
-
-    return TryFrankensteinMethod(prompt, "entrada virtual", function()
-        return PressPromptKey(prompt)
-    end, token, 3)
 end
 
 local function GetRitualComponents()
@@ -902,113 +655,131 @@ local function FindFrankensteinPrompt()
     end)
 end
 
-local function WaitForFrankensteinPrompt(timeout, token)
-    local finishAt = os.clock() + timeout
-
-    while os.clock() < finishAt do
-        if not IsCurrent(token) then
-            return nil
-        end
-
-        local prompt = FindFrankensteinPrompt()
-        if prompt and prompt.Parent and prompt.Enabled then
-            return prompt
-        end
-
-        task.wait(0.15)
-    end
-end
-
-local function OpenFrankensteinDialogue(token)
-    -- Se a caixa ja estiver aberta, nao toca novamente no NPC.
-    local alreadyOpen = WaitForOption(2, 0.25, token)
-    if alreadyOpen then
-        return alreadyOpen
+-- Espera os prompts reais, sem tentar clicar no NPC ou nas opcoes do dialogo.
+local function ReadHauntedRitualSetup()
+    local components = GetRitualComponents()
+    local found = {}
+    local pedestals = {}
+    local required = {["wants bat wing"] = true}
+    for _, name in ipairs(OFFERINGS) do
+        required[string.lower(name)] = true
     end
 
-    for attempt = 1, CONFIG.FRANKENSTEIN_RETRIES do
-        if not IsCurrent(token) then
-            return nil, "Cancelado"
-        end
-
-        SetStatus(string.format(
-            "Falando com Frankenstein %d/%d",
-            attempt,
-            CONFIG.FRANKENSTEIN_RETRIES
-        ))
-
-        local _, _, humanoid = GetCharacter()
-        if humanoid then
-            humanoid:UnequipTools()
-        end
-
-        local prompt = WaitForFrankensteinPrompt(4, token)
-        if not prompt then
-            TeleportTo(Vector3.new(-15107.4, 151.6, -9620.4))
-            WaitCancelable(1.0, token)
-            prompt = WaitForFrankensteinPrompt(3, token)
-        end
-
-        if prompt then
-            -- Posiciona, aguarda o servidor reconhecer o jogador e tenta
-            -- todos os caminhos usados pelo Dialog do jogo.
-            TeleportNearObject(prompt)
-            WaitCancelable(CONFIG.PROMPT_SYNC_WAIT, token)
-
-            local option2 = TriggerFrankensteinDialogue(prompt, token)
-            if option2 then
-                return option2
+    if components then
+        for _, object in ipairs(components:GetDescendants()) do
+            if object:IsA("ProximityPrompt") and object.Enabled then
+                local label = string.lower(object.ObjectText or "")
+                local action = string.lower(object.ActionText or "")
+                if required[label] then
+                    found[label] = object
+                elseif label == "treat pedestal"
+                    and string.find(action, "fill", 1, true)
+                    and tonumber(string.match(action, "%d+")) == 50 then
+                    table.insert(pedestals, object)
+                end
             end
         end
-
-        -- Quando a tentativa e ignorada pelo servidor, o prompt pode sumir
-        -- por um instante. Espera ele voltar antes de repetir.
-        WaitCancelable(1.2, token)
     end
 
-    return nil, "Diálogo do Frankenstein não abriu após as tentativas"
+    local offeringCount = 0
+    for label in pairs(required) do
+        if found[label] then
+            offeringCount = offeringCount + 1
+        end
+    end
+    local setup
+    if offeringCount == #OFFERINGS + 1 and #pedestals == 3 then
+        setup = {components = components, offerings = found, pedestals = pedestals}
+    end
+    return setup, offeringCount, #pedestals
+end
+
+local function SameHauntedSetup(first, second)
+    if not first or not second or first.components ~= second.components then
+        return false
+    end
+    for label, prompt in pairs(first.offerings) do
+        if second.offerings[label] ~= prompt then
+            return false
+        end
+    end
+    local pedestalSet = {}
+    for _, prompt in ipairs(first.pedestals) do
+        pedestalSet[prompt] = true
+    end
+    for _, prompt in ipairs(second.pedestals) do
+        if not pedestalSet[prompt] then
+            return false
+        end
+    end
+    return true
 end
 
 local function StartHauntedRitual(token)
+    if not IsCurrent(token) then
+        return false, "Cancelado"
+    end
     SetStatus("Indo ao Frankenstein")
-
-    -- Se o ritual ja estiver ativo, pula completamente o dialogo.
-    local activePrompt = WaitForOfferingPrompt("Wants Bat Wing", 0.25, token)
-        or WaitForOfferingPrompt("Sour Patch Salmon", 0.25, token)
-    if activePrompt then
-        SetStatus("Ritual já ativo")
-        return true
+    local prompt = FindFrankensteinPrompt()
+    local moved = prompt and TeleportNearObject(prompt)
+    if not moved then
+        moved = TeleportTo(Vector3.new(-15107.4, 151.6, -9620.4))
+    end
+    if not moved then
+        return false, "Nao consegui chegar ao Frankenstein"
+    end
+    if not WaitCancelable(CONFIG.PROMPT_SYNC_WAIT, token) then
+        return false, "Cancelado"
     end
 
-    TeleportTo(Vector3.new(-15107.4, 151.6, -9620.4))
-    WaitCancelable(1.0, token)
-
-    local option2, dialogueReason = OpenFrankensteinDialogue(token)
-    if not option2 then
-        return false, dialogueReason or "Diálogo do Frankenstein não abriu"
+    local _, _, humanoid = GetCharacter()
+    if not IsCurrent(token) then
+        return false, "Cancelado"
     end
-
-    SetStatus("Abrindo lista de rituais")
-    ClickGui(option2)
-    WaitCancelable(1.3, token)
-
-    local option3 = WaitForOption(3, 8, token)
-    if not option3 then
-        return false, "Opção 3 do Haunted Ritual não apareceu"
+    if humanoid then
+        humanoid:UnequipTools()
     end
+    SetStatus("Fale com Frankenstein")
+    Log("Escolha Haunted Ritual manualmente. Vou esperar as oferendas aparecerem.")
 
-    ClickGui(option3)
-    WaitCancelable(1.0, token)
+    local candidate
+    local candidateSince
+    local lastStatus
+    while IsCurrent(token) do
+        local setup, offeringCount, pedestalCount = ReadHauntedRitualSetup()
+        if setup then
+            if not SameHauntedSetup(candidate, setup) then
+                candidate = setup
+                candidateSince = os.clock()
+            elseif os.clock() - candidateSince >= CONFIG.MANUAL_RITUAL_STABLE_TIME then
+                if not IsCurrent(token) then
+                    return false, "Cancelado"
+                end
+                SetStatus("Haunted detectado")
+                Log("Confirmado: Bat Wing, 7 oferendas e 3 pedestais de 50 Treats.")
+                return true
+            end
+        else
+            candidate = nil
+            candidateSince = nil
+        end
 
-    -- Confirma que o ritual realmente começou.
-    local proof = WaitForOfferingPrompt("Wants Bat Wing", 8, token)
-        or WaitForOfferingPrompt("Sour Patch Salmon", 2, token)
-
-    if not proof then
-        return false, "Ritual não iniciou (pode estar em cooldown)"
+        local status
+        if offeringCount == 0 and pedestalCount == 0 then
+            status = "Fale com Frankenstein"
+        else
+            status = string.format("Aguardando: %d/8 + %d/3", offeringCount, pedestalCount)
+        end
+        if lastStatus ~= status then
+            lastStatus = status
+            SetStatus(status)
+        end
+        -- Sem timeout e sem novos TPs durante a conversa.
+        if not WaitCancelable(CONFIG.MANUAL_RITUAL_POLL, token) then
+            return false, "Cancelado"
+        end
     end
-
-    return true
+    return false, "Cancelado"
 end
 
 local function PlaceOneOffering(objectText, label, token)
@@ -1027,6 +798,14 @@ local function PlaceOneOffering(objectText, label, token)
 end
 
 local function PlaceAllOfferings(token)
+    if not IsCurrent(token) then
+        return false, "Cancelado"
+    end
+    local setup = ReadHauntedRitualSetup()
+    if not setup then
+        return false, "Os prompts do Haunted mudaram; selecione o ritual novamente"
+    end
+
     local ok, reason = PlaceOneOffering("Wants Bat Wing", "Bat Wing", token)
     if not ok then
         return false, reason
@@ -1481,6 +1260,9 @@ local function VisitHauntedHouse(number, token)
 end
 
 local function RunOneCycle(token)
+    if not IsCurrent(token) then
+        return false, "Cancelado", false
+    end
     local started, reason = StartHauntedRitual(token)
     if not started then
         return false, reason, false
@@ -1566,6 +1348,9 @@ local function AutomationLoop(token)
 end
 
 local function SetEnabled(state)
+    if Unloaded then
+        return
+    end
     state = state == true
 
     if Enabled == state then
@@ -1660,6 +1445,9 @@ Env.HAUNTED_AUTO_OFF = function()
 end
 
 Env.HAUNTED_AUTO_ONE_CYCLE = function()
+    if Unloaded then
+        return
+    end
     if Running then
         warn("[HAUNTED AUTO] Já existe um ciclo em andamento.")
         return
@@ -1689,6 +1477,7 @@ Env.HAUNTED_AUTO_ONE_CYCLE = function()
 end
 
 Env.HAUNTED_AUTO_STOP = function()
+    Unloaded = true
     Enabled = false
     Generation = Generation + 1
     WaitingForHouse = false
@@ -1716,5 +1505,5 @@ Connect(UnloadButton.Activated, function()
 end)
 
 SetStatus("Desligado")
-Log("Carregado. Toque no botão flutuante para iniciar.")
+Log("v1.4 carregado. Ligue e fale com Frankenstein; selecione Haunted Ritual manualmente.")
 
