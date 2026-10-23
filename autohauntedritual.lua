@@ -1,5 +1,5 @@
 --[[
-    FischFright 3 - Haunted Ritual Auto v1.5 Mobile (detector da mensagem)
+    FischFright 3 - Haunted Ritual Auto v1.6 Mobile (detector da mensagem)
 
     Fluxo observado no jogo:
       TP ao Frankenstein -> jogador escolhe Haunted Ritual manualmente
@@ -19,12 +19,15 @@
       * A frase exata ainda nao foi registrada: o detector reconhece instrucoes
         de preparacao em ingles/portugues e grava o texto recebido no LOG.
       * Oferendas precisam de confirmacao antes de passar aos Treats.
+      * v1.6 localiza o controle do prompt e chama as conexoes de input/clique
+        existentes. O LOG indica o metodo e a mudanca observada.
 ]]
 
 local Players = game:GetService("Players")
 local TextChatService = game:GetService("TextChatService")
 local UserInputService = game:GetService("UserInputService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
+local ProximityPromptService = game:GetService("ProximityPromptService")
 local RunService = game:GetService("RunService")
 local CoreGui = game:GetService("CoreGui")
 
@@ -56,8 +59,8 @@ local CONFIG = {
     MANUAL_RITUAL_POLL = 0.25,
     PREPARATION_MAX_AGE = 85,
     PROMPT_READY_TIMEOUT = 5,
-    PROMPT_CONFIRM_TIMEOUT = 4,
-    PROMPT_ATTEMPTS = 2,
+    PROMPT_CONFIRM_TIMEOUT = 2.5,
+    PROMPT_METHOD_BUDGET = 22,
 }
 
 Env.HAUNTED_AUTO_CONFIG = CONFIG
@@ -121,6 +124,8 @@ local WaitingForHouse = false
 local DetectedHouse = nil
 local LastRitualActivation = nil
 local CurrentStatus = "Desligado"
+local LastTouchInput = nil
+local PreferredPromptMethod = nil
 
 local function Connect(signal, callback)
     local connection = signal:Connect(callback)
@@ -134,8 +139,15 @@ local function Log(message)
     if #DebugLines > 180 then
         table.remove(DebugLines, 1)
     end
-    print("[HAUNTED AUTO v1.5] " .. line)
+    print("[HAUNTED AUTO v1.6] " .. line)
 end
+
+Connect(UserInputService.InputBegan, function(input)
+    if input.UserInputType == Enum.UserInputType.Touch
+        or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        LastTouchInput = input
+    end
+end)
 
 local function NormalizeText(raw)
     local text = tostring(raw or ""):gsub("<.->", "")
@@ -264,123 +276,12 @@ local function FindPrompts(predicate, root)
     return result
 end
 
-local function FirePromptDirect(prompt)
-    if not prompt or not prompt.Parent then
-        return false
-    end
-
-    -- fireproximityprompt aciona o prompt diretamente e funciona no mobile
-    -- sem depender do botao E ou da interface de toque do Roblox.
-    if fireproximityprompt then
-        local ok = pcall(function()
-            fireproximityprompt(prompt, math.max(prompt.HoldDuration, 0))
-        end)
-        if ok then
-            return true
-        end
-    end
-
-    -- Segundo metodo direto para executores sem fireproximityprompt.
-    local holdOk = pcall(function()
-        prompt:InputHoldBegin()
-        task.wait(math.max(prompt.HoldDuration, 0.05) + 0.05)
-        prompt:InputHoldEnd()
-    end)
-    if holdOk then
-        return true
-    end
-
-    -- Ultimo fallback. Alguns executores mobile aceitam a tecla virtual.
-    return pcall(function()
-        local key = prompt.KeyboardKeyCode
-        if key == Enum.KeyCode.Unknown then
-            key = Enum.KeyCode.E
-        end
-        VirtualInputManager:SendKeyEvent(true, key, false, game)
-        task.wait(math.max(prompt.HoldDuration, 0.05) + 0.05)
-        VirtualInputManager:SendKeyEvent(false, key, false, game)
-    end)
-end
-
-local function WaitForPromptChange(prompt, before, token)
-    local deadline = os.clock() + CONFIG.PROMPT_CONFIRM_TIMEOUT
-    local changedSince
-    while os.clock() < deadline and IsCurrent(token) do
-        local changed = not prompt.Parent or not prompt.Enabled
-            or prompt.ObjectText ~= before.object or prompt.ActionText ~= before.action
-        if changed then
-            changedSince = changedSince or os.clock()
-            if os.clock() - changedSince >= 0.45 then
-                return true
-            end
-        else
-            changedSince = nil
-        end
-        if not WaitCancelable(0.1, token) then
-            return false
-        end
-    end
-    return false
-end
-
-local function TriggerPrompt(prompt, token, verifyChange)
-    if not prompt or not prompt.Parent or not IsCurrent(token) then
-        return false
-    end
-    if not TeleportNearObject(prompt) then
-        return false
-    end
-    if not WaitCancelable(CONFIG.PROMPT_SYNC_WAIT, token) then
-        return false
-    end
-
-    local readyDeadline = os.clock() + CONFIG.PROMPT_READY_TIMEOUT
-    while prompt.Parent and not prompt.Enabled and os.clock() < readyDeadline do
-        if not WaitCancelable(0.1, token) then
-            return false
-        end
-    end
-    if not IsCurrent(token) or not prompt.Parent or not prompt.Enabled then
-        return false
-    end
-
-    local attempts = verifyChange and CONFIG.PROMPT_ATTEMPTS or 1
-    local before = {object = prompt.ObjectText, action = prompt.ActionText}
-    for attempt = 1, attempts do
-        if not IsCurrent(token) then
-            return false
-        end
-        local fired
-        if attempt == 1 then
-            fired = FirePromptDirect(prompt)
-        else
-            fired = pcall(function()
-                prompt:InputHoldBegin()
-                WaitCancelable(math.max(prompt.HoldDuration, 0.05) + 0.15, token)
-                prompt:InputHoldEnd()
-            end)
-        end
-
-        if not WaitCancelable(CONFIG.PROMPT_AFTER_WAIT, token) then
-            return false
-        end
-        if verifyChange then
-            if WaitForPromptChange(prompt, before, token) then
-                return true
-            end
-        elseif fired then
-            return true
-        end
-        Log("Sem confirmacao no prompt: " .. tostring(before.object) .. " (tentativa " .. attempt .. ")")
-    end
-    return false
-end
-
 local function IsGuiVisible(object)
     local current = object
 
     while current and current ~= game do
-        if current:IsA("ScreenGui") and not current.Enabled then
+        if (current:IsA("ScreenGui") or current:IsA("BillboardGui")
+            or current:IsA("SurfaceGui")) and not current.Enabled then
             return false
         end
         if current:IsA("GuiObject") and not current.Visible then
@@ -390,6 +291,303 @@ local function IsGuiVisible(object)
     end
 
     return object and object.Parent ~= nil
+end
+
+-- Chama apenas conexoes reais ja ligadas pelo jogo ao controle/sinal.
+-- Um pcall bem-sucedido nao e prova de que a oferenda foi aceita.
+local function CallPromptConnections(signal, ...)
+    if not signal then return false, 0 end
+    local args = table.pack(...)
+    local readable = false
+    local fired = 0
+    if type(getconnections) == "function" then
+        local ok, connections = pcall(getconnections, signal)
+        if ok and type(connections) == "table" then
+            readable = true
+            for _, connection in ipairs(connections) do
+                local enabled, fn, fire
+                pcall(function() enabled = connection.Enabled end)
+                pcall(function() fn = connection.Function end)
+                pcall(function() fire = connection.Fire end)
+                if enabled ~= false then
+                    local invoked, err
+                    if type(fn) == "function" then
+                        invoked, err = pcall(fn, table.unpack(args, 1, args.n))
+                    elseif type(fire) == "function" then
+                        invoked, err = pcall(function()
+                            connection:Fire(table.unpack(args, 1, args.n))
+                        end)
+                    end
+                    if invoked then
+                        fired = fired + 1
+                    elseif err then
+                        Log("Callback retornou erro: " .. tostring(err))
+                    end
+                end
+            end
+        end
+    end
+    if fired > 0 then return true, fired end
+    -- Uma lista vazia foi realmente inspecionada: nao inventa um listener.
+    if readable then return false, 0 end
+    if type(firesignal) == "function" then
+        local ok = pcall(firesignal, signal, table.unpack(args, 1, args.n))
+        return ok, ok and -1 or 0
+    end
+    return false, 0
+end
+
+local function SafeDescendants(root)
+    local ok, descendants = pcall(function() return root:GetDescendants() end)
+    return ok and descendants or {}
+end
+
+local function PromptGuiPathAllowed(object)
+    local path = NormalizeText(object:GetFullName())
+    return not HasAny(path, {
+        ".backpack.", ".hotbar.", ".equipment.", ".quests.",
+        "scrollingframe", ".options.", "hauntedritualautogui", "devconsole",
+    })
+end
+
+local function FindPromptControls(prompt)
+    local result, seen = {}, {}
+    local function add(control)
+        if seen[control] or not control:IsA("GuiObject") or not IsGuiVisible(control)
+            or not PromptGuiPathAllowed(control) then return end
+        if control:IsA("GuiButton") or control.Active then
+            seen[control] = true
+            table.insert(result, control)
+        end
+    end
+    local function inspectContainer(container)
+        if container:IsA("GuiObject") then add(container) end
+        for _, child in ipairs(SafeDescendants(container)) do
+            if child:IsA("GuiButton") or (child:IsA("GuiObject") and child.Active) then
+                add(child)
+            end
+        end
+    end
+    local roots = {PlayerGui, CoreGui}
+    if prompt.Parent then table.insert(roots, prompt.Parent) end
+    local wanted = PromptItemName(prompt.ObjectText)
+    for _, root in ipairs(roots) do
+        for _, object in ipairs(SafeDescendants(root)) do
+            if object:IsA("BillboardGui") and object.Enabled and object.Adornee
+                and (object.Adornee == prompt.Parent or prompt:IsDescendantOf(object.Adornee)) then
+                inspectContainer(object)
+            elseif (object:IsA("TextLabel") or object:IsA("TextButton"))
+                and wanted ~= "" and PromptItemName(object.Text) == wanted
+                and IsGuiVisible(object) and PromptGuiPathAllowed(object) then
+                local container = object
+                -- O menor container local contendo o rotulo e um controle.
+                -- Nao sobe ate o HUD inteiro procurando qualquer botao.
+                for _ = 1, 4 do
+                    if not container or not container:IsA("GuiObject") then break end
+                    local size = container.AbsoluteSize
+                    if size.X > 700 or size.Y > 380 then break end
+                    local countBefore = #result
+                    inspectContainer(container)
+                    if #result > countBefore then break end
+                    container = container.Parent
+                end
+            end
+        end
+    end
+    -- Controles menores (botao da tecla) antes de containers grandes.
+    table.sort(result, function(a, b)
+        return a.AbsoluteSize.X * a.AbsoluteSize.Y < b.AbsoluteSize.X * b.AbsoluteSize.Y
+    end)
+    return result
+end
+
+local function CountInventoryItem(name)
+    local total, found = 0, false
+    local containers = {Backpack}
+    if Player.Character then table.insert(containers, Player.Character) end
+    for _, container in ipairs(containers) do
+        for _, tool in ipairs(container:GetChildren()) do
+            if tool:IsA("Tool") and PromptItemName(tool.Name) == name then
+                found = true
+                local amount = 1
+                local ok, attributes = pcall(function() return tool:GetAttributes() end)
+                if ok then
+                    for key, value in pairs(attributes) do
+                        local lower = NormalizeText(key)
+                        if type(value) == "number" and value >= 0
+                            and (lower == "count" or lower == "amount"
+                                or lower == "quantity" or lower == "stack") then
+                            amount = value
+                            break
+                        end
+                    end
+                end
+                total = total + amount
+            end
+        end
+    end
+    return found and total or nil
+end
+
+local function SnapshotPrompt(prompt)
+    local item = PromptItemName(prompt.ObjectText)
+    return {
+        object = prompt.ObjectText,
+        action = prompt.ActionText,
+        item = item,
+        count = CountInventoryItem(item),
+    }
+end
+
+local function WaitForPromptChange(prompt, before, token)
+    local deadline = os.clock() + CONFIG.PROMPT_CONFIRM_TIMEOUT
+    local changedSince, changeReason
+    while os.clock() < deadline and IsCurrent(token) do
+        local reason
+        local nowCount = before.count and CountInventoryItem(before.item) or nil
+        if before.count and (nowCount or 0) < before.count then
+            reason = "quantidade do item diminuiu"
+        elseif not prompt.Parent then
+            reason = "prompt removido"
+        elseif prompt.ObjectText ~= before.object or prompt.ActionText ~= before.action then
+            reason = "texto/acao do prompt mudou"
+        elseif not prompt.Enabled then
+            reason = "prompt permaneceu desativado"
+        end
+        if reason then
+            if reason ~= changeReason then
+                changeReason, changedSince = reason, os.clock()
+            end
+            local stableTime = reason == "prompt permaneceu desativado" and 1.25 or 0.35
+            if os.clock() - changedSince >= stableTime then return true, reason end
+        else
+            changedSince, changeReason = nil, nil
+        end
+        if not WaitCancelable(0.1, token) then return false, "cancelado" end
+    end
+    return false, "nenhuma mudanca observada"
+end
+
+local function InvokePromptMethod(method, prompt, controls, token)
+    if method:sub(1, 4) == "gui-" then
+        for index, control in ipairs(controls) do
+            if index > 6 or not IsCurrent(token) then break end
+            if control.Parent and IsGuiVisible(control) then
+                local invoked = false
+                local count = 0
+                if method == "gui-input" and LastTouchInput then
+                    invoked, count = CallPromptConnections(control.InputBegan, LastTouchInput)
+                    if invoked then
+                        local held = WaitCancelable(math.max(prompt.HoldDuration, 0.05) + 0.12, token)
+                        -- Libera mesmo em OFF/UNLOAD para nao deixar um hold preso.
+                        CallPromptConnections(control.InputEnded, LastTouchInput)
+                        if not held then return false end
+                    end
+                elseif method == "gui-down-up" and control:IsA("GuiButton") then
+                    local center = control.AbsolutePosition + control.AbsoluteSize / 2
+                    invoked, count = CallPromptConnections(control.MouseButton1Down, center.X, center.Y)
+                    if invoked then
+                        local held = WaitCancelable(math.max(prompt.HoldDuration, 0.05) + 0.12, token)
+                        CallPromptConnections(control.MouseButton1Up, center.X, center.Y)
+                        if not held then return false end
+                    end
+                elseif method == "gui-activated" and control:IsA("GuiButton") then
+                    invoked, count = CallPromptConnections(control.Activated, LastTouchInput, 1)
+                elseif method == "gui-click" and control:IsA("GuiButton") then
+                    invoked, count = CallPromptConnections(control.MouseButton1Click)
+                end
+                if invoked then
+                    Log("Controle: " .. control:GetFullName() .. " | " .. method .. " | callbacks=" .. count)
+                    return true
+                end
+            end
+        end
+        return false
+    elseif method == "prompt-triggered" then
+        return CallPromptConnections(prompt.Triggered, Player)
+    elseif method == "service-triggered" then
+        return CallPromptConnections(ProximityPromptService.PromptTriggered, prompt, Player)
+    elseif method == "engine-direct" and type(fireproximityprompt) == "function" then
+        return pcall(fireproximityprompt, prompt)
+    elseif method == "engine-hold" then
+        return pcall(function()
+            prompt:InputHoldBegin()
+            WaitCancelable(math.max(prompt.HoldDuration, 0.05) + 0.12, token)
+            prompt:InputHoldEnd()
+        end)
+    end
+    return false
+end
+
+local function TriggerPrompt(prompt, token, verifyChange)
+    if not prompt or not prompt.Parent or not IsCurrent(token) then return false end
+    if not TeleportNearObject(prompt) then return false end
+    if not WaitCancelable(CONFIG.PROMPT_SYNC_WAIT, token) then return false end
+    local readyDeadline = os.clock() + CONFIG.PROMPT_READY_TIMEOUT
+    while prompt.Parent and not prompt.Enabled and os.clock() < readyDeadline do
+        if not WaitCancelable(0.1, token) then return false end
+    end
+    if not IsCurrent(token) or not prompt.Parent or not prompt.Enabled then return false end
+
+    local controls = FindPromptControls(prompt)
+    Log("Alvo: " .. prompt:GetFullName() .. " | objeto=" .. prompt.ObjectText
+        .. " | acao=" .. prompt.ActionText .. " | controles=" .. #controls
+        .. " | getconnections=" .. tostring(type(getconnections) == "function"))
+    local methods = {
+        "gui-input", "gui-down-up", "gui-activated", "gui-click",
+        "prompt-triggered", "service-triggered", "engine-direct", "engine-hold",
+    }
+    if PreferredPromptMethod then
+        for index, method in ipairs(methods) do
+            if method == PreferredPromptMethod then
+                table.remove(methods, index)
+                table.insert(methods, 1, method)
+                break
+            end
+        end
+    end
+    local before = SnapshotPrompt(prompt)
+    local startedAt = os.clock()
+    local attempts = {}
+    for _, method in ipairs(methods) do
+        if method:sub(1, 4) == "gui-" then
+            for index, control in ipairs(controls) do
+                if index > 6 then break end
+                table.insert(attempts, {method = method, controls = {control}})
+            end
+        else
+            table.insert(attempts, {method = method, controls = controls})
+        end
+    end
+    for _, attempt in ipairs(attempts) do
+        local method = attempt.method
+        if not IsCurrent(token) then return false end
+        if os.clock() - startedAt > CONFIG.PROMPT_METHOD_BUDGET then break end
+        -- Nunca dispara outro metodo se a tentativa anterior ja mudou o alvo.
+        if not prompt.Parent or not prompt.Enabled or prompt.ObjectText ~= before.object
+            or prompt.ActionText ~= before.action then
+            local accepted, reason = WaitForPromptChange(prompt, before, token)
+            if accepted then Log("Confirmado: " .. reason); return true end
+            return false
+        end
+        local ok, attempted = pcall(InvokePromptMethod, method, prompt, attempt.controls, token)
+        if not ok then
+            Log(method .. " retornou erro: " .. tostring(attempted))
+        elseif attempted then
+            Log("Metodo executado: " .. method .. " (aguardando efeito)")
+            if not WaitCancelable(CONFIG.PROMPT_AFTER_WAIT, token) then return false end
+            if not verifyChange then return true end
+            local accepted, reason = WaitForPromptChange(prompt, before, token)
+            if accepted then
+                PreferredPromptMethod = method
+                Log("Confirmado: " .. reason .. " | metodo=" .. method)
+                return true
+            end
+            Log("Sem efeito confirmado: " .. method)
+        end
+    end
+    Log("Nao consegui confirmar a interacao de " .. tostring(before.object))
+    return false
 end
 
 local function ClickGui(button)
@@ -592,7 +790,7 @@ local function SetStatus(status)
             and Color3.fromRGB(80, 235, 135)
             or Color3.fromRGB(210, 210, 210)
         ToggleButton.Text = string.format(
-            "HAUNTED v1.5: %s\n%s",
+            "HAUNTED v1.6: %s\n%s",
             Enabled and "ON" or "OFF",
             CurrentStatus
         )
@@ -1735,7 +1933,7 @@ Connect(UnloadButton.Activated, function()
 end)
 
 local function CopyDebugLog()
-    local text = "HAUNTED AUTO v1.5\n" .. table.concat(DebugLines, "\n")
+    local text = "HAUNTED AUTO v1.6\n" .. table.concat(DebugLines, "\n")
     if setclipboard then
         local ok = pcall(setclipboard, text)
         if ok then
@@ -1753,5 +1951,5 @@ Env.HAUNTED_AUTO_COPY_LOG = CopyDebugLog
 Connect(LogButton.Activated, CopyDebugLog)
 
 SetStatus("Desligado")
-Log("v1.5: ligue ANTES de falar com Frankenstein. O LOG copia o texto real detectado.")
+Log("v1.6: detector mantido; interacao por callbacks do controle. Veja LOG se um prompt falhar.")
 
