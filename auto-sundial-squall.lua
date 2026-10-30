@@ -1,4 +1,5 @@
 -- AUTO SUNDIAL v4 | sem GUI | pausa e retomada por ciclo
+-- Alvo: somente Raging Squall.
 -- Clima: somente avisos novos do chat/tela e texto do indicador atual de clima.
 -- Historico do chat e avisos que ja existiam ao executar NAO iniciam eventos.
 -- F9 ou console do executor: procure [AutoSundial].
@@ -68,8 +69,7 @@ local function watch(signal, fn, label)
     if ok and connection then connections[connection] = true; return connection end
 end
 local targets = {
-    tropicalsquall = "Tropical Squall", shimmeringtropicalsquall = "Tropical Squall",
-    ragingsquall = "Raging Squall", tempestsquall = "Tempest Squall",
+    ragingsquall = "Raging Squall",
 }
 local starts = {hasdescended = true, hasbegun = true, hasstarted = true}
 local finishes = {hasended = true, haspassed = true, hasdissipated = true,
@@ -87,8 +87,8 @@ local function classify(text, bannerTitle)
             end
         end
     end
-    -- Apenas banners novos conhecidos; "Tempest Squall" solto nao e inicio.
-    if bannerTitle and (t == "shimmeringtropicalsquall" or t == "tropicalsquall" or t == "ragingsquall") then
+    -- Apenas o banner novo de Raging Squall inicia a pausa.
+    if bannerTitle and t == "ragingsquall" then
         return "start", targets[t]
     end
 end
@@ -228,7 +228,8 @@ end
 local otherWeather = {clear = true, rain = true, rainy = true, windy = true, foggy = true,
     stormy = true, storm = true, aurora = true, auroraborealis = true, eclipse = true,
     starfall = true, rainbow = true, tropicalsun = true, snow = true, blizzard = true,
-    heatwave = true, sandstorm = true, duststorm = true, drought = true}
+    heatwave = true, sandstorm = true, duststorm = true, drought = true,
+    tropicalsquall = true, shimmeringtropicalsquall = true, tempestsquall = true}
 local function weatherText(text)
     local t = compact(text):gsub("^currentweather", ""):gsub("^weather", "")
     if targets[t] then return targets[t] end
@@ -245,7 +246,7 @@ local function candidate(object, record, changed)
         record.Pending = t ~= "" -- lido UMA vez quando ficar visivel; nunca a cada ciclo
     end
     local relevant = weather or t:find("squall", 1, true)
-        or (banner and (t == "tropical" or t == "raging" or t == "shimmeringtropical"))
+        or (banner and t == "raging")
     candidates[object] = relevant and record or nil
 end
 local function attachText(object, initial)
